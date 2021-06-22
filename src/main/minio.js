@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-import fs from 'fs'
 import Crypto from 'crypto'
 import Http from 'http'
 import Https from 'https'
@@ -24,7 +23,6 @@ import Xml from 'xml'
 import xml2js from 'xml2js'
 import async from 'async'
 import querystring from 'querystring'
-import mkdirp from 'mkdirp'
 import path from 'path'
 import _ from 'lodash'
 import util from 'util'
@@ -758,80 +756,6 @@ export class Client {
     )
   }
 
-  // Callback is called with `error` in case of error or `null` in case of success
-  //
-  // __Arguments__
-  // * `bucketName` _string_: name of the bucket
-  // * `objectName` _string_: name of the object
-  // * `filePath` _string_: path to which the object data will be written to
-  // * `getOpts` _object_: Version of the object in the form `{versionId:'my-uuid'}`. Default is `{}`. (optional)
-  // * `callback(err)` _function_: callback is called with `err` in case of error.
-  fGetObject(bucketName, objectName, filePath, getOpts={}, cb) {
-    // Input validation.
-    if (!isValidBucketName(bucketName)) {
-      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
-    }
-    if (!isValidObjectName(objectName)) {
-      throw new errors.InvalidObjectNameError(`Invalid object name: ${objectName}`)
-    }
-    if (!isString(filePath)) {
-      throw new TypeError('filePath should be of type "string"')
-    }
-    // Backward Compatibility
-    if (isFunction(getOpts)) {
-      cb = getOpts
-      getOpts = {}
-    }
-
-    if (!isFunction(cb)) {
-      throw new TypeError('callback should be of type "function"')
-    }
-
-    // Internal data.
-    var partFile
-    var partFileStream
-    var objStat
-
-    // Rename wrapper.
-    var rename = err => {
-      if (err) return cb(err)
-      fs.rename(partFile, filePath, cb)
-    }
-
-    async.waterfall([
-      cb => this.statObject(bucketName, objectName, getOpts, cb),
-      (result, cb) => {
-        objStat = result
-        // Create any missing top level directories.
-        mkdirp(path.dirname(filePath), cb)
-      },
-      (ignore, cb) => {
-        partFile = `${filePath}.${objStat.etag}.part.minio`
-        fs.stat(partFile, (e, stats) => {
-          var offset = 0
-          if (e) {
-            partFileStream = fs.createWriteStream(partFile, {flags: 'w'})
-          } else {
-            if (objStat.size === stats.size) return rename()
-            offset = stats.size
-            partFileStream = fs.createWriteStream(partFile, {flags: 'a'})
-          }
-          this.getPartialObject(bucketName, objectName, offset, 0, getOpts, cb)
-        })
-      },
-      (downloadStream, cb) => {
-        pipesetup(downloadStream, partFileStream)
-          .on('error', e => cb(e))
-          .on('finish', cb)
-      },
-      cb => fs.stat(partFile, cb),
-      (stats, cb) => {
-        if (stats.size === objStat.size) return cb()
-        cb(new Error('Size mismatch between downloaded file and the object'))
-      }
-    ], rename)
-  }
-
   // Callback is called with readable stream of the object content.
   //
   // __Arguments__
@@ -920,145 +844,6 @@ export class Client {
 
     var query = querystring.stringify(getOpts)
     this.makeRequest({method, bucketName, objectName, headers, query}, '', expectedStatus, '', true, cb)
-  }
-
-  // Uploads the object using contents from a file
-  //
-  // __Arguments__
-  // * `bucketName` _string_: name of the bucket
-  // * `objectName` _string_: name of the object
-  // * `filePath` _string_: file path of the file to be uploaded
-  // * `metaData` _Javascript Object_: metaData assosciated with the object
-  // * `callback(err, objInfo)` _function_: non null `err` indicates error, `objInfo` _object_ which contains versionId and etag.
-  fPutObject(bucketName, objectName, filePath, metaData, callback) {
-    if (!isValidBucketName(bucketName)) {
-      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
-    }
-    if (!isValidObjectName(objectName)) {
-      throw new errors.InvalidObjectNameError(`Invalid object name: ${objectName}`)
-    }
-
-    if (!isString(filePath)) {
-      throw new TypeError('filePath should be of type "string"')
-    }
-    if (isFunction(metaData)) {
-      callback = metaData
-      metaData = {} // Set metaData empty if no metaData provided.
-    }
-    if (!isObject(metaData)) {
-      throw new TypeError('metaData should be of type "object"')
-    }
-
-    // Inserts correct `content-type` attribute based on metaData and filePath
-    metaData = insertContentType(metaData, filePath)
-
-    //Updates metaData to have the correct prefix if needed
-    metaData = prependXAMZMeta(metaData)
-    var size
-    var partSize
-
-    async.waterfall([
-      cb => fs.stat(filePath, cb),
-      (stats, cb) => {
-        size = stats.size
-        if (size > this.maxObjectSize) {
-          return cb(new Error(`${filePath} size : ${stats.size}, max allowed size : 5TB`))
-        }
-        if (size <= this.partSize) {
-          // simple PUT request, no multipart
-          var multipart = false
-          var uploader = this.getUploader(bucketName, objectName, metaData, multipart)
-          var hash = transformers.getHashSummer(this.enableSHA256)
-          var start = 0
-          var end = size - 1
-          var autoClose = true
-          if (size === 0) end = 0
-          var options = {start, end, autoClose}
-          pipesetup(fs.createReadStream(filePath, options), hash)
-            .on('data', data => {
-              var md5sum = data.md5sum
-              var sha256sum = data.sha256sum
-              var stream = fs.createReadStream(filePath, options)
-              uploader(stream, size, sha256sum, md5sum, (err, objInfo) => {
-                callback(err, objInfo)
-                cb(true)
-              })
-            })
-            .on('error', e => cb(e))
-          return
-        }
-        this.findUploadId(bucketName, objectName, cb)
-      },
-      (uploadId, cb) => {
-        // if there was a previous incomplete upload, fetch all its uploaded parts info
-        if (uploadId) return this.listParts(bucketName, objectName, uploadId,  (e, etags) =>  cb(e, uploadId, etags))
-        // there was no previous upload, initiate a new one
-        this.initiateNewMultipartUpload(bucketName, objectName, metaData, (e, uploadId) => cb(e, uploadId, []))
-      },
-      (uploadId, etags, cb) => {
-        partSize = this.calculatePartSize(size)
-        var multipart = true
-        var uploader = this.getUploader(bucketName, objectName, metaData, multipart)
-
-        // convert array to object to make things easy
-        var parts = etags.reduce(function(acc, item) {
-          if (!acc[item.part]) {
-            acc[item.part] = item
-          }
-          return acc
-        }, {})
-        var partsDone = []
-        var partNumber = 1
-        var uploadedSize = 0
-        async.whilst(
-          cb => { cb(null, uploadedSize < size) },
-          cb => {
-            var part = parts[partNumber]
-            var hash = transformers.getHashSummer(this.enableSHA256)
-            var length = partSize
-            if (length > (size - uploadedSize)) {
-              length = size - uploadedSize
-            }
-            var start = uploadedSize
-            var end = uploadedSize + length - 1
-            var autoClose = true
-            var options = {autoClose, start, end}
-            // verify md5sum of each part
-            pipesetup(fs.createReadStream(filePath, options), hash)
-              .on('data', data => {
-                var md5sumHex = (Buffer.from(data.md5sum, 'base64')).toString('hex')
-                if (part && (md5sumHex === part.etag)) {
-                  //md5 matches, chunk already uploaded
-                  partsDone.push({part: partNumber, etag: part.etag})
-                  partNumber++
-                  uploadedSize += length
-                  return cb()
-                }
-                // part is not uploaded yet, or md5 mismatch
-                var stream = fs.createReadStream(filePath, options)
-                uploader(uploadId, partNumber, stream, length,
-                         data.sha256sum, data.md5sum, (e, objInfo) => {
-                           if (e) return cb(e)
-                           partsDone.push({part: partNumber, etag: objInfo.etag})
-                           partNumber++
-                           uploadedSize += length
-                           return cb()
-                         })
-              })
-              .on('error', e => cb(e))
-          },
-          e => {
-            if (e) return cb(e)
-            cb(null, partsDone, uploadId)
-          }
-        )
-      },
-      // all parts uploaded, complete the multipart upload
-      (etags, uploadId, cb) => this.completeMultipartUpload(bucketName, objectName, uploadId, etags, cb)
-    ], (err, ...rest) => {
-      if (err === true) return
-      callback(err, ...rest)
-    })
   }
 
   // Uploads the object.
@@ -3061,9 +2846,7 @@ Client.prototype.removeBucket = promisify(Client.prototype.removeBucket)
 
 Client.prototype.getObject = promisify(Client.prototype.getObject)
 Client.prototype.getPartialObject = promisify(Client.prototype.getPartialObject)
-Client.prototype.fGetObject = promisify(Client.prototype.fGetObject)
 Client.prototype.putObject = promisify(Client.prototype.putObject)
-Client.prototype.fPutObject = promisify(Client.prototype.fPutObject)
 Client.prototype.copyObject = promisify(Client.prototype.copyObject)
 Client.prototype.statObject = promisify(Client.prototype.statObject)
 Client.prototype.removeObject = promisify(Client.prototype.removeObject)

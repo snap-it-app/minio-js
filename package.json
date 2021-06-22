@@ -38,7 +38,6 @@
     "json-stream": "^1.0.0",
     "lodash": "^4.17.20",
     "mime-types": "^2.1.14",
-    "mkdirp": "^0.5.1",
     "querystring": "0.2.0",
     "through2": "^3.0.1",
     "xml": "^1.0.0",
